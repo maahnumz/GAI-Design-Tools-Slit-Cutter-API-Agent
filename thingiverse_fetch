@@ -1,0 +1,167 @@
+"""
+thingiverse_fetch.py
+
+Fetch details and download all STL files for a single Thingiverse item.
+
+Usage:
+    python thingiverse_fetch.py <thing_id> --token <your_api_token>
+
+Example:
+    python thingiverse_fetch.py 3730558 --token abc123yourtokenhere
+
+How to get your API token:
+    1. Go to https://www.thingiverse.com/apps/create
+    2. Fill in any app name/description and agree to terms
+    3. Click "Create & Get App Key"
+    4. Copy the "App Token" value — that is your API token
+"""
+
+import argparse
+import json
+import os
+import sys
+
+import requests
+
+
+BASE_URL = "https://api.thingiverse.com"
+
+
+def get_headers(token: str) -> dict:
+    """Return auth headers for every request."""
+    return {"Authorization": f"Bearer {token}"}
+
+
+def fetch_thing_details(thing_id: int, token: str) -> dict:
+    """
+    GET /things/{id}
+    Returns metadata: name, description, creator, license, tags, etc.
+    """
+    url = f"{BASE_URL}/things/{thing_id}"
+    response = requests.get(url, headers=get_headers(token))
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_thing_files(thing_id: int, token: str) -> list:
+    """
+    GET /things/{id}/files
+    Returns a list of all files attached to the thing, including STLs.
+    Each file has: id, name, size, download_url, public_url, etc.
+    """
+    url = f"{BASE_URL}/things/{thing_id}/files"
+    response = requests.get(url, headers=get_headers(token))
+    response.raise_for_status()
+    return response.json()
+
+
+def download_file(download_url: str, dest_path: str, token: str) -> None:
+    """
+    Download a single file from the Thingiverse CDN to dest_path.
+    Uses streaming so large STLs don't fill memory.
+    """
+    response = requests.get(download_url, headers=get_headers(token), stream=True)
+    response.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch details and STL files for a Thingiverse item."
+    )
+    parser.add_argument(
+        "thing_id",
+        type=int,
+        help="The numeric Thingiverse item ID (e.g. 3730558)",
+    )
+    parser.add_argument(
+        "--token",
+        required=True,
+        help="Your Thingiverse App Token (from https://www.thingiverse.com/apps)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory to save downloaded STL files (default: current directory)",
+    )
+    parser.add_argument(
+        "--details-only",
+        action="store_true",
+        help="Print item details but do not download any files",
+    )
+    args = parser.parse_args()
+
+    # --- Fetch and print item details ---
+    print(f"Fetching details for thing ID: {args.thing_id} ...")
+    try:
+        details = fetch_thing_details(args.thing_id, args.token)
+    except requests.HTTPError as e:
+        print(f"Error fetching thing details: {e}")
+        sys.exit(1)
+
+    print("\n=== Item Details ===")
+    print(f"  Name        : {details.get('name')}")
+    print(f"  ID          : {details.get('id')}")
+    print(f"  Creator     : {details.get('creator', {}).get('name')}")
+    print(f"  License     : {details.get('license')}")
+    print(f"  Description : {details.get('description', '').strip()[:200]}")
+    print(f"  Public URL  : {details.get('public_url')}")
+    print(f"  Added       : {details.get('added')}")
+    print(f"  Modified    : {details.get('modified')}")
+
+    # Save full details as JSON alongside the STLs
+    os.makedirs(args.output_dir, exist_ok=True)
+    details_path = os.path.join(args.output_dir, f"thing_{args.thing_id}_details.json")
+    with open(details_path, "w", encoding="utf-8") as f:
+        json.dump(details, f, indent=2)
+    print(f"\n  Full details saved to: {details_path}")
+
+    if args.details_only:
+        return
+
+    # --- Fetch file list ---
+    print(f"\nFetching file list for thing ID: {args.thing_id} ...")
+    try:
+        files = fetch_thing_files(args.thing_id, args.token)
+    except requests.HTTPError as e:
+        print(f"Error fetching file list: {e}")
+        sys.exit(1)
+
+    # Filter to STL files only
+    stl_files = [f for f in files if f.get("name", "").lower().endswith(".stl")]
+
+    print(f"\n=== Files ===")
+    print(f"  Total files : {len(files)}")
+    print(f"  STL files   : {len(stl_files)}")
+
+    if not stl_files:
+        print("  No STL files found for this item.")
+        return
+
+    # --- Download each STL ---
+    print(f"\nDownloading {len(stl_files)} STL file(s) to: {os.path.abspath(args.output_dir)}\n")
+    for i, file_info in enumerate(stl_files, start=1):
+        filename = file_info.get("name", f"file_{file_info['id']}.stl")
+        download_url = file_info.get("download_url")
+        size_bytes = file_info.get("size", 0)
+        dest_path = os.path.join(args.output_dir, filename)
+
+        print(f"  [{i}/{len(stl_files)}] {filename} ({size_bytes / 1024:.1f} KB) ... ", end="", flush=True)
+
+        if not download_url:
+            print("SKIPPED (no download_url)")
+            continue
+
+        try:
+            download_file(download_url, dest_path, args.token)
+            print("OK")
+        except requests.HTTPError as e:
+            print(f"FAILED ({e})")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
