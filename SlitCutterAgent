@@ -1,0 +1,850 @@
+SlitCutter_v3
+
+Purpose: Modify an existing SVG file intended for laser cutting by inserting a 50mm width x 3mm height oval slit cutout centered horizontally, and 8mm up from the bottom of the bounding box of the main body geometry.
+Type: Deterministic (no LLM)
+"""
+import sys
+import os
+import re
+import math
+import copy
+import xml.etree.ElementTree as ET
+from collections import namedtuple
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from core.fab_agent import DeterministicAgent
+from core.types import FilePort
+from core.paths import get_file_path, get_output_dir, sanitize_filename
+from core.result import register_file
+from core.utilities.path_utils import parse_input_for_path
+
+
+BBox = namedtuple('BBox', ['min_x', 'min_y', 'max_x', 'max_y'])
+
+# Constants
+SLIT_WIDTH_MM = 50.0                  # CHANGED: was THUMBHOLE_DIAMETER_MM = 20.0
+SLIT_RX_MM = SLIT_WIDTH_MM / 2.0     # CHANGED: was THUMBHOLE_RADIUS_MM = THUMBHOLE_DIAMETER_MM / 2.0
+SLIT_HEIGHT_MM = 3.0                  # CHANGED: new constant
+SLIT_RY_MM = SLIT_HEIGHT_MM / 2.0    # CHANGED: new constant
+SLIT_OFFSET_FROM_BOTTOM_MM = 8.0     # CHANGED: was THUMBHOLE_OFFSET_FROM_BOTTOM_MM = 15.0
+PX_PER_MM = 3.7795275591  # 96 DPI
+MIN_DIMENSION_MM = 45.0              # CHANGED: was 25.0
+
+SVG_NS = 'http://www.w3.org/2000/svg'
+XLINK_NS = 'http://www.w3.org/1999/xlink'
+
+# We need to preserve namespaces properly
+NAMESPACES = {
+    'svg': SVG_NS,
+    'xlink': XLINK_NS,
+    'inkscape': 'http://www.inkscape.org/namespaces/inkscape',
+    'sodipodi': 'http://sodipodi.sourceforge.net/DTD/sodipodi-0.0.dtd',
+    'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+    'cc': 'http://creativecommons.org/ns#',
+    'dc': 'http://purl.org/dc/elements/1.1/',
+}
+
+
+def _strip_ns(tag):
+    """Strip namespace from a tag name."""
+    if tag.startswith('{'):
+        return tag.split('}', 1)[1]
+    return tag
+
+
+def _parse_length(value_str):
+    """Parse an SVG length value and return (numeric_value, unit).
+    Returns value in user units (px) and the detected unit string."""
+    if value_str is None:
+        return None, None
+    value_str = value_str.strip()
+    # Match number followed by optional unit
+    m = re.match(r'^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(mm|cm|in|pt|pc|px|em|ex|%)?$', value_str)
+    if not m:
+        return None, None
+    val = float(m.group(1))
+    unit = m.group(2) if m.group(2) else 'px'
+    return val, unit
+
+
+def _to_user_units(value, unit):
+    """Convert a value with a given unit to SVG user units (px at 96 DPI)."""
+    if unit == 'px' or unit is None:
+        return value
+    elif unit == 'mm':
+        return value * PX_PER_MM
+    elif unit == 'cm':
+        return value * PX_PER_MM * 10.0
+    elif unit == 'in':
+        return value * 96.0
+    elif unit == 'pt':
+        return value * (96.0 / 72.0)
+    elif unit == 'pc':
+        return value * (96.0 / 6.0)
+    else:
+        return value
+
+
+def _detect_document_unit(root):
+    """Detect the primary unit used in the SVG document.
+    Returns the unit string and a scale factor from mm to document units."""
+    # Check width/height attributes for unit hints
+    width_str = root.get('width')
+    height_str = root.get('height')
+
+    for attr_str in [width_str, height_str]:
+        if attr_str:
+            _, unit = _parse_length(attr_str)
+            if unit and unit in ('mm', 'cm', 'in'):
+                return unit
+
+    # Check viewBox vs width/height to determine if user units are mm
+    viewbox = root.get('viewBox')
+    if viewbox and width_str:
+        parts = viewbox.replace(',', ' ').split()
+        if len(parts) == 4:
+            vb_width = float(parts[2])
+            w_val, w_unit = _parse_length(width_str)
+            if w_val and w_unit == 'mm' and abs(vb_width - w_val) < 0.01:
+                return 'mm'
+
+    return 'px'
+
+
+def _get_scale_mm_to_doc(root):
+    """Return the scale factor: how many document user units equal 1mm."""
+    doc_unit = _detect_document_unit(root)
+
+    viewbox = root.get('viewBox')
+    width_str = root.get('width')
+
+    if viewbox and width_str:
+        parts = viewbox.replace(',', ' ').split()
+        if len(parts) == 4:
+            vb_width = float(parts[2])
+            w_val, w_unit = _parse_length(width_str)
+            if w_val and w_val > 0:
+                w_px = _to_user_units(w_val, w_unit)
+                # user_units_per_px = vb_width / w_px
+                # 1mm in px = PX_PER_MM
+                # 1mm in user units = PX_PER_MM * (vb_width / w_px)
+                scale = PX_PER_MM * (vb_width / w_px)
+                return scale
+
+    if doc_unit == 'mm':
+        return 1.0
+    elif doc_unit == 'cm':
+        return 0.1
+    elif doc_unit == 'in':
+        return 1.0 / 25.4
+    else:
+        # Default: user units are px at 96 DPI
+        return PX_PER_MM
+
+
+def _tokenize_path(d):
+    """Tokenize an SVG path 'd' attribute into a list of (command, args) tuples."""
+    if not d:
+        return []
+    # Split into tokens
+    tokens = re.findall(r'[MmZzLlHhVvCcSsQqTtAa]|[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?', d)
+    commands = []
+    current_cmd = None
+    current_args = []
+
+    for token in tokens:
+        if re.match(r'^[MmZzLlHhVvCcSsQqTtAa]$', token):
+            if current_cmd is not None:
+                commands.append((current_cmd, current_args))
+            current_cmd = token
+            current_args = []
+        else:
+            current_args.append(float(token))
+
+    if current_cmd is not None:
+        commands.append((current_cmd, current_args))
+
+    return commands
+
+
+def _bbox_from_path(d):
+    """Compute a bounding box from an SVG path 'd' attribute.
+    This is an approximation that samples curve control points."""
+    commands = _tokenize_path(d)
+    if not commands:
+        return None
+
+    points = []
+    cx, cy = 0.0, 0.0  # current point
+    sx, sy = 0.0, 0.0  # start of subpath
+
+    for cmd, args in commands:
+        if cmd == 'M':
+            i = 0
+            while i + 1 < len(args):
+                cx, cy = args[i], args[i + 1]
+                points.append((cx, cy))
+                sx, sy = cx, cy
+                i += 2
+        elif cmd == 'm':
+            i = 0
+            first = True
+            while i + 1 < len(args):
+                if first:
+                    cx += args[i]
+                    cy += args[i + 1]
+                    sx, sy = cx, cy
+                    first = False
+                else:
+                    cx += args[i]
+                    cy += args[i + 1]
+                points.append((cx, cy))
+                i += 2
+        elif cmd == 'L':
+            i = 0
+            while i + 1 < len(args):
+                cx, cy = args[i], args[i + 1]
+                points.append((cx, cy))
+                i += 2
+        elif cmd == 'l':
+            i = 0
+            while i + 1 < len(args):
+                cx += args[i]
+                cy += args[i + 1]
+                points.append((cx, cy))
+                i += 2
+        elif cmd == 'H':
+            for val in args:
+                cx = val
+                points.append((cx, cy))
+        elif cmd == 'h':
+            for val in args:
+                cx += val
+                points.append((cx, cy))
+        elif cmd == 'V':
+            for val in args:
+                cy = val
+                points.append((cx, cy))
+        elif cmd == 'v':
+            for val in args:
+                cy += val
+                points.append((cx, cy))
+        elif cmd == 'C':
+            i = 0
+            while i + 5 < len(args):
+                # Control points and endpoint
+                points.append((args[i], args[i + 1]))
+                points.append((args[i + 2], args[i + 3]))
+                cx, cy = args[i + 4], args[i + 5]
+                points.append((cx, cy))
+                i += 6
+        elif cmd == 'c':
+            i = 0
+            while i + 5 < len(args):
+                points.append((cx + args[i], cy + args[i + 1]))
+                points.append((cx + args[i + 2], cy + args[i + 3]))
+                cx += args[i + 4]
+                cy += args[i + 5]
+                points.append((cx, cy))
+                i += 6
+        elif cmd == 'S':
+            i = 0
+            while i + 3 < len(args):
+                points.append((args[i], args[i + 1]))
+                cx, cy = args[i + 2], args[i + 3]
+                points.append((cx, cy))
+                i += 4
+        elif cmd == 's':
+            i = 0
+            while i + 3 < len(args):
+                points.append((cx + args[i], cy + args[i + 1]))
+                cx += args[i + 2]
+                cy += args[i + 3]
+                points.append((cx, cy))
+                i += 4
+        elif cmd == 'Q':
+            i = 0
+            while i + 3 < len(args):
+                points.append((args[i], args[i + 1]))
+                cx, cy = args[i + 2], args[i + 3]
+                points.append((cx, cy))
+                i += 4
+        elif cmd == 'q':
+            i = 0
+            while i + 3 < len(args):
+                points.append((cx + args[i], cy + args[i + 1]))
+                cx += args[i + 2]
+                cy += args[i + 3]
+                points.append((cx, cy))
+                i += 4
+        elif cmd == 'T':
+            i = 0
+            while i + 1 < len(args):
+                cx, cy = args[i], args[i + 1]
+                points.append((cx, cy))
+                i += 2
+        elif cmd == 't':
+            i = 0
+            while i + 1 < len(args):
+                cx += args[i]
+                cy += args[i + 1]
+                points.append((cx, cy))
+                i += 2
+        elif cmd == 'A':
+            i = 0
+            while i + 6 < len(args):
+                # For bbox, include endpoint and estimate arc extent
+                rx, ry = abs(args[i]), abs(args[i + 1])
+                ex, ey = args[i + 5], args[i + 6]
+                # Add corners of bounding rect around arc (rough approximation)
+                mid_x = (cx + ex) / 2
+                mid_y = (cy + ey) / 2
+                points.append((mid_x - rx, mid_y - ry))
+                points.append((mid_x + rx, mid_y + ry))
+                cx, cy = ex, ey
+                points.append((cx, cy))
+                i += 7
+        elif cmd == 'a':
+            i = 0
+            while i + 6 < len(args):
+                rx, ry = abs(args[i]), abs(args[i + 1])
+                ex = cx + args[i + 5]
+                ey = cy + args[i + 6]
+                mid_x = (cx + ex) / 2
+                mid_y = (cy + ey) / 2
+                points.append((mid_x - rx, mid_y - ry))
+                points.append((mid_x + rx, mid_y + ry))
+                cx, cy = ex, ey
+                points.append((cx, cy))
+                i += 7
+        elif cmd in ('Z', 'z'):
+            cx, cy = sx, sy
+
+    if not points:
+        return None
+
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return BBox(min(xs), min(ys), max(xs), max(ys))
+
+
+def _bbox_from_rect(elem):
+    """Extract bounding box from a <rect> element."""
+    ns = _get_elem_ns(elem)
+    x = float(elem.get('x', '0'))
+    y = float(elem.get('y', '0'))
+    w = float(elem.get('width', '0'))
+    h = float(elem.get('height', '0'))
+    if w <= 0 or h <= 0:
+        return None
+    return BBox(x, y, x + w, y + h)
+
+
+def _bbox_from_circle(elem):
+    """Extract bounding box from a <circle> element."""
+    cx = float(elem.get('cx', '0'))
+    cy = float(elem.get('cy', '0'))
+    r = float(elem.get('r', '0'))
+    if r <= 0:
+        return None
+    return BBox(cx - r, cy - r, cx + r, cy + r)
+
+
+def _bbox_from_ellipse(elem):
+    """Extract bounding box from an <ellipse> element."""
+    cx = float(elem.get('cx', '0'))
+    cy = float(elem.get('cy', '0'))
+    rx = float(elem.get('rx', '0'))
+    ry = float(elem.get('ry', '0'))
+    if rx <= 0 or ry <= 0:
+        return None
+    return BBox(cx - rx, cy - ry, cx + rx, cy + ry)
+
+
+def _bbox_from_line(elem):
+    """Extract bounding box from a <line> element."""
+    x1 = float(elem.get('x1', '0'))
+    y1 = float(elem.get('y1', '0'))
+    x2 = float(elem.get('x2', '0'))
+    y2 = float(elem.get('y2', '0'))
+    return BBox(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+
+def _bbox_from_polyline_or_polygon(elem):
+    """Extract bounding box from a <polyline> or <polygon> element."""
+    points_str = elem.get('points', '')
+    if not points_str.strip():
+        return None
+    # Parse points: can be "x1,y1 x2,y2" or "x1 y1 x2 y2" etc
+    nums = re.findall(r'[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?', points_str)
+    if len(nums) < 2:
+        return None
+    xs = [float(nums[i]) for i in range(0, len(nums) - 1, 2)]
+    ys = [float(nums[i]) for i in range(1, len(nums), 2)]
+    return BBox(min(xs), min(ys), max(xs), max(ys))
+
+
+def _get_elem_ns(elem):
+    """Get namespace of element."""
+    tag = elem.tag
+    if tag.startswith('{'):
+        return tag.split('}')[0] + '}'
+    return ''
+
+
+def _merge_bbox(a, b):
+    """Merge two bounding boxes."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return BBox(
+        min(a.min_x, b.min_x),
+        min(a.min_y, b.min_y),
+        max(a.max_x, b.max_x),
+        max(a.max_y, b.max_y)
+    )
+
+
+def _compute_element_bbox(elem):
+    """Compute bbox for a single SVG shape element."""
+    tag = _strip_ns(elem.tag)
+
+    if tag == 'path':
+        d = elem.get('d')
+        if d:
+            return _bbox_from_path(d)
+    elif tag == 'rect':
+        return _bbox_from_rect(elem)
+    elif tag == 'circle':
+        return _bbox_from_circle(elem)
+    elif tag == 'ellipse':
+        return _bbox_from_ellipse(elem)
+    elif tag == 'line':
+        return _bbox_from_line(elem)
+    elif tag in ('polyline', 'polygon'):
+        return _bbox_from_polyline_or_polygon(elem)
+    return None
+
+
+def _compute_tree_bbox(elem):
+    """Recursively compute bounding box of all visible geometry in the element tree."""
+    tag = _strip_ns(elem.tag)
+
+    # Skip defs, clipPath, mask, metadata, and other non-visible elements
+    if tag in ('defs', 'clipPath', 'mask', 'metadata', 'title', 'desc',
+               'linearGradient', 'radialGradient', 'pattern', 'filter',
+               'style', 'script', 'symbol'):
+        return None
+
+    # Check display/visibility
+    display = elem.get('display', '')
+    if display == 'none':
+        return None
+    visibility = elem.get('visibility', '')
+    if visibility == 'hidden':
+        return None
+
+    bbox = _compute_element_bbox(elem)
+
+    for child in elem:
+        child_bbox = _compute_tree_bbox(child)
+        bbox = _merge_bbox(bbox, child_bbox)
+
+    return bbox
+
+
+def _detect_stroke_mode(root):
+    """Detect whether the SVG primarily uses stroke-only paths (laser cutting style)
+    or fill-based shapes. Returns 'stroke' or 'fill'."""
+    has_fill = False
+    has_stroke = False
+
+    for elem in root.iter():
+        tag = _strip_ns(elem.tag)
+        if tag in ('path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon'):
+            fill = elem.get('fill', '')
+            stroke = elem.get('stroke', '')
+            style = elem.get('style', '')
+
+            # Parse style attribute
+            fill_from_style = None
+            stroke_from_style = None
+            if style:
+                for part in style.split(';'):
+                    part = part.strip()
+                    if part.startswith('fill:'):
+                        fill_from_style = part.split(':', 1)[1].strip()
+                    elif part.startswith('stroke:'):
+                        stroke_from_style = part.split(':', 1)[1].strip()
+
+            effective_fill = fill_from_style if fill_from_style is not None else fill
+            effective_stroke = stroke_from_style if stroke_from_style is not None else stroke
+
+            if effective_fill and effective_fill != 'none':
+                has_fill = True
+            if effective_stroke and effective_stroke != 'none':
+                has_stroke = True
+
+    if has_stroke and not has_fill:
+        return 'stroke'
+    elif has_fill:
+        return 'fill'
+    else:
+        return 'stroke'  # default for laser cutting
+
+
+def _get_dominant_stroke(root):
+    """Get the most commonly used stroke color and width from the SVG."""
+    stroke_colors = {}
+    stroke_widths = {}
+
+    for elem in root.iter():
+        tag = _strip_ns(elem.tag)
+        if tag in ('path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon'):
+            stroke = elem.get('stroke', '')
+            stroke_width = elem.get('stroke-width', '')
+            style = elem.get('style', '')
+
+            if style:
+                for part in style.split(';'):
+                    part = part.strip()
+                    if part.startswith('stroke:') and not part.startswith('stroke-'):
+                        stroke = part.split(':', 1)[1].strip()
+                    elif part.startswith('stroke-width:'):
+                        stroke_width = part.split(':', 1)[1].strip()
+
+            if stroke and stroke != 'none':
+                stroke_colors[stroke] = stroke_colors.get(stroke, 0) + 1
+            if stroke_width:
+                stroke_widths[stroke_width] = stroke_widths.get(stroke_width, 0) + 1
+
+    color = 'red'  # default laser cut color
+    width = '0.1'  # thin line for laser
+
+    if stroke_colors:
+        color = max(stroke_colors, key=stroke_colors.get)
+    if stroke_widths:
+        width = max(stroke_widths, key=stroke_widths.get)
+
+    return color, width
+
+
+# CHANGED: was _circle_path_cw — now ellipse, takes rx and ry instead of r
+def _slit_path_cw(cx, cy, rx, ry):
+    """Generate a clockwise ellipse path (for hole in nonzero fill rule)."""
+    return (
+        f"M {cx},{cy - ry} "
+        f"A {rx},{ry} 0 0,0 {cx},{cy + ry} "
+        f"A {rx},{ry} 0 0,0 {cx},{cy - ry} Z"
+    )
+
+
+# CHANGED: was _circle_path_ccw — now ellipse, takes rx and ry instead of r
+def _slit_path_ccw(cx, cy, rx, ry):
+    """Generate a counter-clockwise ellipse path."""
+    return (
+        f"M {cx},{cy - ry} "
+        f"A {rx},{ry} 0 0,1 {cx},{cy + ry} "
+        f"A {rx},{ry} 0 0,1 {cx},{cy - ry} Z"
+    )
+
+
+class SlitCutterToothpasteCopyAgent(DeterministicAgent):
+    """Modify an existing SVG file for laser cutting by inserting a 50mm x 3mm
+    oval slit cutout centered horizontally, 8mm up from the bottom of the
+    bounding box of the main body geometry."""  # CHANGED: updated docstring
+
+    INPUT_TYPE = FilePort(name="input_svg", extensions=["svg"], description="Input SVG file for laser cutting")
+    OUTPUT_TYPE = FilePort(name="output_svg", extensions=["svg"], description="Modified SVG with slit cutout")  # CHANGED: "thumbhole" -> "slit"
+
+    def execute(self, content: str, files: list = None):
+        """
+        Execute the slit insertion logic.  # CHANGED: "thumbhole" -> "slit"
+
+        Args:
+            content: Input string (may be a file path or raw data)
+            files: Resolved input file paths (provided by the runtime)
+
+        Returns:
+            Status message string
+        """
+        warnings = []
+
+        # --- Resolve input file ---
+        if files:
+            svg_path = files[0]
+        else:
+            svg_path = parse_input_for_path(content, extensions=['.svg'])
+        if not svg_path:
+            return "Error: Could not find input SVG file. Please provide an SVG file path."
+
+        if not os.path.exists(svg_path):
+            return f"Error: File not found: {svg_path}"
+
+        # --- Read and parse SVG ---
+        try:
+            with open(svg_path, 'r', encoding='utf-8') as f:
+                svg_content = f.read()
+        except Exception as e:
+            return f"Error reading SVG file: {e}"
+
+        # Register namespaces before parsing to preserve them on output
+        # Extract all namespace declarations from the source
+        ns_map = {}
+        for m in re.finditer(r'xmlns:?(\w*)=["\']([^"\']+)["\']', svg_content):
+            prefix = m.group(1)
+            uri = m.group(2)
+            if prefix:
+                ns_map[prefix] = uri
+            # Register with ET
+            try:
+                if prefix:
+                    ET.register_namespace(prefix, uri)
+                else:
+                    ET.register_namespace('', uri)
+            except Exception:
+                pass
+
+        # Ensure SVG namespace is registered
+        ET.register_namespace('', SVG_NS)
+        ET.register_namespace('xlink', XLINK_NS)
+
+        try:
+            tree = ET.parse(svg_path)
+            root = tree.getroot()
+        except ET.ParseError as e:
+            return f"Error parsing SVG: {e}"
+
+        # --- Compute bounding box ---
+        bbox = _compute_tree_bbox(root)
+        if bbox is None:
+            return "Error: No detectable geometry bounding box found in the SVG. The file may be empty or contain only non-visible elements."
+
+        # --- Determine coordinate scale ---
+        mm_to_doc = _get_scale_mm_to_doc(root)
+
+        # Convert bbox to mm for validation
+        bbox_width_mm = (bbox.max_x - bbox.min_x) / mm_to_doc
+        bbox_height_mm = (bbox.max_y - bbox.min_y) / mm_to_doc
+
+        # --- Edge case: small bounding box ---
+        if bbox_width_mm < MIN_DIMENSION_MM:  # CHANGED: threshold now 45mm, matches SLIT_WIDTH_MM + margin
+            warnings.append(
+                f"Warning: Bounding box width ({bbox_width_mm:.1f}mm) is less than {MIN_DIMENSION_MM}mm. "
+                f"The slit ({SLIT_WIDTH_MM}mm wide) may exceed the part boundary."  # CHANGED
+            )
+        if bbox_height_mm < MIN_DIMENSION_MM:
+            warnings.append(
+                f"Warning: Bounding box height ({bbox_height_mm:.1f}mm) is less than {MIN_DIMENSION_MM}mm. "
+                f"The slit ({SLIT_WIDTH_MM}mm wide) may exceed the part boundary."  # CHANGED
+            )
+
+        # --- Calculate slit center in document units ---  # CHANGED: "thumbhole" -> "slit"
+        # Centered horizontally in the bounding box
+        center_x = (bbox.min_x + bbox.max_x) / 2.0
+        # 8mm up from the bottom of the bounding box  # CHANGED: was 6mm
+        offset_doc = SLIT_OFFSET_FROM_BOTTOM_MM * mm_to_doc  # CHANGED
+        rx_doc = SLIT_RX_MM * mm_to_doc   # CHANGED: was radius_doc = THUMBHOLE_RADIUS_MM * mm_to_doc
+        ry_doc = SLIT_RY_MM * mm_to_doc   # CHANGED: new second axis
+        center_y = bbox.max_y - offset_doc  # SVG y-axis goes down
+
+        # --- Detect rendering mode ---
+        mode = _detect_stroke_mode(root)
+        stroke_color, stroke_width = _get_dominant_stroke(root)
+
+        # --- Determine SVG namespace prefix ---
+        svg_prefix = ''
+        root_tag = root.tag
+        if root_tag.startswith('{'):
+            svg_ns_uri = root_tag.split('}')[0] + '}'
+        else:
+            svg_ns_uri = ''
+
+        # --- Create a unique clip path ID ---
+        clip_id = 'slit-inverse-clip'  # CHANGED: was 'thumbhole-inverse-clip'
+        # Make sure it doesn't collide with existing IDs
+        existing_ids = set()
+        for elem in root.iter():
+            eid = elem.get('id')
+            if eid:
+                existing_ids.add(eid)
+        counter = 1
+        while clip_id in existing_ids:
+            clip_id = f'slit-inverse-clip-{counter}'  # CHANGED
+            counter += 1
+
+        # --- Find or create <defs> element ---
+        defs_elem = None
+        for child in root:
+            if _strip_ns(child.tag) == 'defs':
+                defs_elem = child
+                break
+
+        if defs_elem is None:
+            if svg_ns_uri:
+                defs_elem = ET.SubElement(root, f'{svg_ns_uri}defs')
+            else:
+                defs_elem = ET.SubElement(root, 'defs')
+            # Insert defs as first child
+            root.remove(defs_elem)
+            root.insert(0, defs_elem)
+
+        # --- Create inverse clip path ---
+        # The inverse clip is a large rectangle (covering the entire SVG) with
+        # the slit ellipse cut out using even-odd fill rule  # CHANGED
+        if svg_ns_uri:
+            clip_path_elem = ET.SubElement(defs_elem, f'{svg_ns_uri}clipPath')
+        else:
+            clip_path_elem = ET.SubElement(defs_elem, 'clipPath')
+        clip_path_elem.set('id', clip_id)
+
+        # Large rectangle covering entire viewBox or document
+        # Use a generous boundary beyond the bbox
+        margin = max(bbox.max_x - bbox.min_x, bbox.max_y - bbox.min_y) * 0.5
+        clip_min_x = bbox.min_x - margin
+        clip_min_y = bbox.min_y - margin
+        clip_max_x = bbox.max_x + margin
+        clip_max_y = bbox.max_y + margin
+        clip_w = clip_max_x - clip_min_x
+        clip_h = clip_max_y - clip_min_y
+
+        # Create a path: outer rectangle (CCW in SVG = CW visually) + inner ellipse (opposite winding)
+        # SVG even-odd fill rule will make the ellipse a hole  # CHANGED: "circle" -> "ellipse"
+        rect_path = (
+            f"M {clip_min_x},{clip_min_y} "
+            f"L {clip_max_x},{clip_min_y} "
+            f"L {clip_max_x},{clip_max_y} "
+            f"L {clip_min_x},{clip_max_y} Z"
+        )
+        slit_hole_path = _slit_path_ccw(center_x, center_y, rx_doc, ry_doc)  # CHANGED: was _circle_path_ccw(center_x, center_y, radius_doc)
+
+        combined_path = rect_path + " " + slit_hole_path  # CHANGED: variable name
+
+        if svg_ns_uri:
+            clip_path_path = ET.SubElement(clip_path_elem, f'{svg_ns_uri}path')
+        else:
+            clip_path_path = ET.SubElement(clip_path_elem, 'path')
+        clip_path_path.set('d', combined_path)
+        clip_path_path.set('fill-rule', 'evenodd')
+        clip_path_path.set('clip-rule', 'evenodd')
+
+        # --- Wrap existing content in a group with the clip path ---
+        # Collect all children of root that are not defs
+        children_to_wrap = []
+        children_indices = []
+        for i, child in enumerate(list(root)):
+            tag = _strip_ns(child.tag)
+            if tag not in ('defs',):
+                children_to_wrap.append(child)
+                children_indices.append(i)
+
+        # Create wrapper group
+        if svg_ns_uri:
+            wrapper_group = ET.Element(f'{svg_ns_uri}g')
+        else:
+            wrapper_group = ET.Element('g')
+        wrapper_group.set('clip-path', f'url(#{clip_id})')
+        wrapper_group.set('id', 'slit-clipped-content')  # CHANGED: was 'thumbhole-clipped-content'
+
+        # Move children into wrapper
+        for child in children_to_wrap:
+            root.remove(child)
+            wrapper_group.append(child)
+
+        # Add wrapper group to root
+        root.append(wrapper_group)
+
+        # --- Add the slit cut ellipse ---  # CHANGED: "thumbhole cut circle" -> "slit cut ellipse"
+        if mode == 'stroke':
+            # Stroke-only mode: add ellipse as a stroke path  # CHANGED
+            if svg_ns_uri:
+                slit_elem = ET.SubElement(root, f'{svg_ns_uri}ellipse')  # CHANGED: circle -> ellipse
+            else:
+                slit_elem = ET.SubElement(root, 'ellipse')  # CHANGED
+            slit_elem.set('cx', f'{center_x:.6f}')
+            slit_elem.set('cy', f'{center_y:.6f}')
+            slit_elem.set('rx', f'{rx_doc:.6f}')   # CHANGED: was circle_elem.set('r', ...)
+            slit_elem.set('ry', f'{ry_doc:.6f}')   # CHANGED: new attribute
+            slit_elem.set('fill', 'none')
+            slit_elem.set('stroke', stroke_color)
+            slit_elem.set('stroke-width', stroke_width)
+            slit_elem.set('id', 'slit-cut')  # CHANGED: was 'thumbhole-cut'
+        else:
+            # Fill mode: add as a path element for potential compositing
+            # The clip path already handles removing interior geometry
+            # Add the ellipse as a visible cut line as well  # CHANGED
+            if svg_ns_uri:
+                slit_elem = ET.SubElement(root, f'{svg_ns_uri}ellipse')  # CHANGED
+            else:
+                slit_elem = ET.SubElement(root, 'ellipse')  # CHANGED
+            slit_elem.set('cx', f'{center_x:.6f}')
+            slit_elem.set('cy', f'{center_y:.6f}')
+            slit_elem.set('rx', f'{rx_doc:.6f}')   # CHANGED
+            slit_elem.set('ry', f'{ry_doc:.6f}')   # CHANGED
+            slit_elem.set('fill', 'none')
+            slit_elem.set('stroke', stroke_color if stroke_color != 'none' else 'red')
+            slit_elem.set('stroke-width', stroke_width if stroke_width else '0.1')
+            slit_elem.set('id', 'slit-cut')  # CHANGED: was 'thumbhole-cut'
+
+        # --- Write output ---
+        base = os.path.splitext(os.path.basename(svg_path))[0]
+        out_name = sanitize_filename(f"{base}_thumbhole", ".svg")
+        out_path = get_file_path(out_name)
+
+        try:
+            # Write using ElementTree
+            tree = ET.ElementTree(root)
+
+            # We need to ensure proper XML declaration and namespace handling
+            # Use a custom write approach to preserve the original structure better
+            svg_output = ET.tostring(root, encoding='unicode', xml_declaration=False)
+
+            # Add XML declaration
+            xml_decl = '<?xml version="1.0" encoding="UTF-8"?>\n'
+
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(xml_decl)
+                f.write(svg_output)
+                f.write('\n')
+
+        except Exception as e:
+            return f"Error writing output SVG: {e}"
+
+        register_file(out_path, 'svg', 'SVG with 50mm x 3mm slit cutout for laser cutting')  # CHANGED
+
+        # --- Build result message ---
+        result_parts = []
+        result_parts.append(f"Slit cutout added successfully.")  # CHANGED
+        result_parts.append(f"  Input: {svg_path}")
+        result_parts.append(f"  Output: {out_path}")
+        result_parts.append(f"  Bounding box: {bbox_width_mm:.1f}mm x {bbox_height_mm:.1f}mm")
+        result_parts.append(f"  Slit: {SLIT_WIDTH_MM}mm wide x {SLIT_HEIGHT_MM}mm tall oval")  # CHANGED
+        result_parts.append(f"  Position: centered horizontally, {SLIT_OFFSET_FROM_BOTTOM_MM}mm from bottom")  # CHANGED
+        result_parts.append(f"  Center (doc units): ({center_x:.2f}, {center_y:.2f})")
+        result_parts.append(f"  rx (doc units): {rx_doc:.2f}")   # CHANGED: was "Radius"
+        result_parts.append(f"  ry (doc units): {ry_doc:.2f}")   # CHANGED: new line
+        result_parts.append(f"  Scale: 1mm = {mm_to_doc:.4f} doc units")
+        result_parts.append(f"  Mode: {mode}")
+        result_parts.append(f"  Stroke: {stroke_color}, width: {stroke_width}")
+
+        if warnings:
+            result_parts.append("")
+            for w in warnings:
+                result_parts.append(w)
+
+        return "\n".join(result_parts)
+
+
+def get_agent():
+    config = {
+        'name': 'slit_cutter_toothpaste_copy_agent',
+        'description': (
+            'Modify an existing SVG file intended for laser cutting by inserting a '
+            '50mm x 3mm oval slit cutout centered horizontally, 8mm up from the bottom '  # CHANGED
+            'of the bounding box of the main body geometry. Applies inverse clipping to remove '
+            'interior geometry and adds a cut line for the slit.'  # CHANGED
+        ),
+        'enabled': True
+    }
+    return SlitCutterToothpasteCopyAgent(config)
